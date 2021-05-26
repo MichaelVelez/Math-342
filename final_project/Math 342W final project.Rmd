@@ -1,0 +1,199 @@
+---
+title: "Final Project"
+author: "Michael Velez"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(magrittr)
+library(stringr)
+library(rpart)
+library(missForest)
+library(glmnet)
+library(broom)
+library(randomForest)
+library(rsample)
+library(rpart.plot) 
+library(ipred) 
+library(caret) 
+pacman::p_install_gh("kapelner/YARF", subdir = "YARF", ref = "dev")
+pacman::p_install_gh("kapelner/YARF", subdir = "YARFJARs", ref = "dev")
+pacman::p_install_gh("kapelner/YARF", subdir = "YARF", ref = "dev")
+pacman::p_load(YARF)
+```
+
+
+```{r}
+setwd("~/Documents/GitHub/Math-342")
+#imports the housing data
+housing_data = data.frame(read.csv("housing_data_2016_2017.csv", header = TRUE))
+#allows us to view the data; understand the columns before manipulating 
+View(housing_data)
+```
+
+
+```{r}
+#Drop all columns that give no insight
+housing_data %<>%
+  select(-c(HITId, HITTypeId, Title, Description, Keywords, CreationTime, MaxAssignments, RequesterAnnotation, 
+            AssignmentDurationInSeconds, AutoApprovalDelayInSeconds, Expiration, NumberOfSimilarHITs, LifetimeInSeconds, 
+            AssignmentId, WorkerId, AssignmentStatus, AcceptTime, SubmitTime, AutoApprovalTime, ApprovalTime,RejectionTime, RequesterFeedback, WorkTimeInSeconds, LifetimeApprovalRate, Last30DaysApprovalRate, Last7DaysApprovalRate, URL, url, model_type, listing_price_to_nearest_1000, community_district_num, Reward, date_of_sale))
+View(housing_data)
+
+```
+
+```{r}
+##Data cleaning##
+
+#observe column's data types in order to convert if necessary 
+length(housing_data)
+
+#remove all $ from columns
+housing_data %<>%
+mutate(sale_price = as.numeric(gsub("[^0-9A-Za-z///' ]","" , sale_price))) %>%
+mutate(total_taxes = as.numeric(gsub("[^0-9A-Za-z///' ]","" , total_taxes))) %>%
+mutate(common_charges = as.numeric(gsub("[^0-9A-Za-z///' ]","" , common_charges))) %>%
+mutate(maintenance_cost = as.numeric(gsub("[^0-9A-Za-z///' ]","" , maintenance_cost))) %>%
+mutate(parking_charges = as.numeric(gsub("[^0-9A-Za-z///' ]","" , parking_charges))) %>%
+
+#Fix spelling errors or inconsistencies 
+mutate(kitchen_type=ifelse(kitchen_type==c("efficiemcy","efficiency","efficiency kitchen","efficiency ktchen"),"efficiency",ifelse(kitchen_type==c("eat in","Eat in","Eat In","eatin"),"eat in","other")))  %>%
+mutate(fuel_type=ifelse(fuel_type==c("Other","other"), "other",fuel_type)) %>%
+
+#transform to binary values 
+mutate(cats_allowed = ifelse(cats_allowed == "no", 0, 1)) %>%
+mutate(dogs_allowed = ifelse(dogs_allowed == "no", 0, 1)) %>%
+mutate(garage_exists = ifelse(is.na(garage_exists), 0, 1)) %>%
+mutate(coop_condo = factor(tolower(coop_condo))) %>%
+mutate(coop_or_condo = ifelse(coop_condo == "condo", 0, 1)) %<>%
+  select(-coop_condo) %<>% 
+
+#extract zipcode from address to make location organized
+mutate(zip = str_extract(full_address_or_zip_code, "[0-9]{5}")) %>%
+#convert to a numeric
+mutate(zip = as.numeric(zip)) %>%
+#Group the zipcodes and eliminate any zip that is not in Queens
+mutate(area = as.factor(
+      ifelse(zip>=11361 & zip<=11364, "Northeast Queens",
+      ifelse(zip>=11354 & zip<=11360, "North Queens",
+      ifelse(zip>=11365 & zip<=11367, "Central Queens",
+      ifelse(zip==11436 | zip==11423 | (zip>=11432 & zip<=11436), "Jamaica",
+      ifelse(zip>=11101 & zip<=11106, "Northwest Queens",
+      ifelse(zip==11374 | zip==11375 | zip==11379 | zip==11385, "West Central Queens", 
+      ifelse(zip==11004 | zip==11005 | zip==11411 | zip==11422 | (zip>=11426 & zip<=11429), "Southest Queens",
+      ifelse(zip>=11413 & zip<=11421, "Southwest Queens", 
+      ifelse(zip==11368 | zip==11369 | zip==11370 | zip==11372 | zip==11373 | zip==11377 | zip==11378, "West Queens", NA))))))))))) %<>%
+
+#Full address no longer needed
+select(-full_address_or_zip_code) %<>%
+
+#These columns are better suited as factor over chr
+mutate(dining_room_type = as.factor(dining_room_type)) %<>%
+mutate(fuel_type = as.factor(fuel_type)) %<>%
+mutate(kitchen_type = as.factor(kitchen_type)) %<>%
+
+#convert to numeric to use missForest
+mutate(approx_year_built = as.numeric(approx_year_built)) %<>%
+mutate(num_bedrooms = as.numeric(num_bedrooms)) %<>%
+mutate(num_floors_in_building = as.numeric(num_floors_in_building)) %<>%
+mutate(num_full_bathrooms = as.numeric(num_full_bathrooms)) %<>%
+mutate(num_total_rooms = as.numeric(num_total_rooms)) %<>%
+mutate(walk_score = as.numeric(walk_score)) %<>%
+
+#Create this useful column that could provide additional insight
+mutate(dog_or_cat_allowed = ifelse(cats_allowed + dogs_allowed > 0, 1, 0)) 
+
+str(housing_data)
+View(housing_data)
+```
+```{r}
+#Dropping observations that have NA for sale_price
+#We could convert NA to 0, but it's better in this
+#case to just drop them
+ pacman::p_load(missForest)
+
+new_housing_data = housing_data %>% 
+  filter(!is.na(sale_price))
+#Removes feature with 30% NA and higher
+new_housing_data = new_housing_data[, which(colMeans(!is.na(new_housing_data)) > 0.7)] 
+View(new_housing_data)
+str(new_housing_data)
+
+##Imputing missing data
+missing_data = tbl_df(apply(is.na(new_housing_data), 2,as.numeric))
+colnames(missing_data) = paste("is_missing_", colnames(new_housing_data), sep = "")
+missing_data %<>% 
+  select_if(function(x){sum(x) > 0})
+
+#Best use is missForest
+housing_imp = missForest(data.frame(new_housing_data))$ximp
+housing_imp
+
+summary(housing_imp)
+```
+```{r}
+##Train-Test Split
+set.seed(30)
+options(java.parameters = "-Xmx4000m")
+pacman::p_load(YARF)
+set.seed(34)
+test_prop = 0.20
+train_indices = sample(1 : nrow(housing_imp), round((1 - test_prop) * nrow(housing_imp)))
+housing_imp_train = housing_imp[train_indices, ]
+y_train = housing_imp_train$sale_price
+X_train = housing_imp_train
+X_train$sale_price = NULL
+n_train = nrow(X_train)
+test_indices = setdiff(1 : nrow(housing_imp), train_indices)
+housing_imp_test = housing_imp[test_indices, ]
+y_test = housing_imp_test$sale_price
+X_test = housing_imp_test
+X_test$sale_price = NULL
+```
+```{r}
+##Regression Tree
+tree_mod = YARFCART(X_train, y_train,
+            calculate_oob_error = TRUE)
+illustrate_trees(tree_mod, max_depth = 5, open_file = TRUE)
+get_tree_num_nodes_leaves_max_depths(tree_mod)
+
+y_hat_train = predict(tree_mod, housing_imp_train)
+e = y_train - y_hat_train
+sd(e)
+1 - sd(e) / sd(y_train)
+```
+```{r}
+## Linear Regression
+
+linear_model = lm(sale_price ~ ., housing_imp_train)
+summary(linear_model)$r.squared
+summary(linear_model)$sigma
+sd(linear_model$residuals)
+summary(linear_model)
+```
+
+```{r}
+##Random Forest
+set.seed(95)
+y = housing_imp$sale_price
+X = housing_imp
+
+X$sell_price = NULL
+
+num_trees = 500
+rf = YARF(X, y, num_trees = num_trees)
+rf
+illustrate_trees(rf, max_depth = 4, open_file = TRUE)
+# Random Forest for in sample
+holdout_rf = YARF(housing_imp_train, housing_imp_train$sale_price, num_trees = num_trees)
+rf
+#RSME for the Random Forest in OOS
+rmse = sd(y_test - predict(holdout_rf, housing_imp_test))
+rmse
+r_squared = 1 - (sum((y_test - predict(holdout_rf, housing_tbl_imp_test))^2)/ sum((y_test - mean(y))^2))
+r_squared 
+
+```
